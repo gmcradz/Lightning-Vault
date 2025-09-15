@@ -15,8 +15,11 @@ from urllib.parse import urlparse
 from waitress import serve
 import requests
 import sys
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
+import rlp
+from eth_utils import keccak, to_checksum_address
+from eth_keys.datatypes import Signature
+from eth_keys.exceptions import ValidationError as BadSignatureError
+from eth_keys import keys
 
 # Set decimal precision for financial calculations
 getcontext().prec = 18
@@ -31,44 +34,27 @@ logger = logging.getLogger(__name__)
 class CryptoUtils:
     @staticmethod
     def generate_keypair():
-        """Generate RSA key pair for digital signatures"""
-        private_key = rsa.generate_private_key(
-            public_exponent=65537,
-            key_size=2048,
-        )
-        public_key = private_key.public_key()
+        """Generate secp256k1 key pair for Ethereum-style digital signatures"""
+        private_key_bytes = os.urandom(32)
+        private_key = keys.PrivateKey(private_key_bytes)
+        public_key = private_key.public_key
         return private_key, public_key
     
     @staticmethod
     def sign_transaction(private_key, transaction_data):
-        """Sign transaction with private key"""
+        """Sign transaction using secp256k1 (Ethereum-style)"""
         message = json.dumps(transaction_data, sort_keys=True).encode()
-        signature = private_key.sign(
-            message,
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH
-            ),
-            hashes.SHA256()
-        )
-        return signature.hex()
+        signature = private_key.sign_msg(message)
+        return signature.to_hex()
     
     @staticmethod
     def verify_signature(public_key, signature_hex, transaction_data):
-        """Verify transaction signature"""
+        """Verify secp256k1 signature"""
         try:
             message = json.dumps(transaction_data, sort_keys=True).encode()
-            signature = bytes.fromhex(signature_hex)
-            public_key.verify(
-                signature,
-                message,
-                padding.PSS(
-                    mgf=padding.MGF1(hashes.SHA256()),
-                    salt_length=padding.PSS.MAX_LENGTH
-                ),
-                hashes.SHA256()
-            )
-            return True
+            sig_hex = signature_hex[2:] if isinstance(signature_hex, str) and signature_hex.startswith('0x') else signature_hex
+            signature = keys.Signature(bytes.fromhex(sig_hex))
+            return public_key.verify_msg(message, signature)
         except Exception:
             return False
 
@@ -135,9 +121,9 @@ class Blockchain:
         self.data_file = data_file
         # Chain/network IDs (persisted). Default can be overridden via env on first run.
         try:
-            self.chain_id = int(os.environ.get("CHAIN_ID", "1337"))
+            self.chain_id = int(os.environ.get("CHAIN_ID", "296070"))
         except Exception:
-            self.chain_id = 1337
+            self.chain_id = 296070
         self.mempool = []  # Pending transactions
         self.max_transactions_per_block = 100
         self.block_time_target = 60  # seconds
@@ -149,6 +135,8 @@ class Blockchain:
         ]
         
         self.load_chain()
+        # Ensure contracts registry structure exists
+        self._ensure_contracts_registry()
         
         # No pre-seeding of balances; balances are derived from chain transactions
         
@@ -159,6 +147,13 @@ class Blockchain:
         
         # Start background processes
         self.start_difficulty_adjustment_thread()
+
+    def _ensure_contracts_registry(self):
+        """Ensure contracts registry has the expected structure (e.g., NFT namespace)."""
+        if not isinstance(self.contracts, dict):
+            self.contracts = {}
+        if 'nft' not in self.contracts:
+            self.contracts['nft'] = {}
 
     def create_genesis_block(self):
         """Create the genesis block with premine to founder address."""
@@ -232,18 +227,42 @@ class Blockchain:
         return block
 
     def process_transaction(self, tx_data):
-        """Process individual transaction with proper validation"""
+        """Process individual transaction with proper validation and NFT support"""
+        tx_type = tx_data.get('tx_type', 'transfer')
         sender = tx_data['sender']
         receiver = tx_data['receiver']
-        amount = Decimal(tx_data['amount'])
-        
+        amount = Decimal(str(tx_data.get('amount', '0')))
+
+        # For standard value transfers and NFT-related value fees, move balances first (except system/genesis senders)
         if sender not in ["SYSTEM", "GENESIS"]:
             if self.balances.get(sender, Decimal('0')) < amount:
                 logger.warning(f"Transaction rejected: Insufficient balance for {sender}")
                 return False
             self.balances[sender] -= amount
-        
         self.balances[receiver] = self.balances.get(receiver, Decimal('0')) + amount
+
+        # Handle contract operations
+        if tx_type == 'nft_mint':
+            data = tx_data.get('data', {})
+            contract = data.get('contract')
+            to = data.get('to')
+            metadata = data.get('metadata', {})
+            try:
+                self.mint_nft(contract, to, metadata)
+            except Exception as e:
+                logger.warning(f"NFT mint failed: {e}")
+                return False
+        elif tx_type == 'nft_transfer':
+            data = tx_data.get('data', {})
+            contract = data.get('contract')
+            token_id = str(data.get('token_id'))
+            to = data.get('to')
+            try:
+                self.transfer_nft(contract, token_id, sender, to)
+            except Exception as e:
+                logger.warning(f"NFT transfer failed: {e}")
+                return False
+
         return True
 
     def add_transaction_to_mempool(self, transaction):
@@ -269,6 +288,32 @@ class Blockchain:
                            if tx['sender'] == transaction.sender)
         if pending_amount + transaction.amount > self.balances.get(transaction.sender, Decimal('0')):
             return False
+        
+        # Additional checks for NFT operations
+        if transaction.tx_type == 'nft_mint':
+            # Enforce mint fee
+            if Decimal(str(transaction.amount)) < Decimal('10'):
+                return False
+            data = transaction.data or {}
+            contract = data.get('contract')
+            to = data.get('to')
+            if not contract or not to:
+                return False
+            if 'nft' not in self.contracts or contract not in self.contracts['nft']:
+                return False
+        if transaction.tx_type == 'nft_transfer':
+            data = transaction.data or {}
+            contract = data.get('contract')
+            token_id = str(data.get('token_id')) if data.get('token_id') is not None else None
+            to = data.get('to')
+            if not contract or token_id is None or not to:
+                return False
+            nft_map = self.contracts.get('nft', {}).get(contract)
+            if not nft_map:
+                return False
+            token = nft_map['tokens'].get(token_id)
+            if not token or token['owner'] != transaction.sender:
+                return False
         
         return True
 
@@ -578,6 +623,8 @@ class Blockchain:
                 self.chain_id = int(data.get("chain_id", self.chain_id))
                 
                 logger.info(f"Loaded chain with {len(self.chain)} blocks")
+                # Ensure registry structure after load
+                self._ensure_contracts_registry()
                 
         except FileNotFoundError:
             logger.info("No existing chain found, starting fresh")
@@ -601,6 +648,63 @@ class Blockchain:
         self.contracts = {}
         self.tokens = {}
         self.mempool = []
+        self._ensure_contracts_registry()
+
+    # -------------------------------
+    # NFT Contracts
+    # -------------------------------
+    def create_nft_contract(self, owner, name, symbol, base_uri=""):
+        self._ensure_contracts_registry()
+        contract_address = generate_address()
+        self.contracts['nft'][contract_address] = {
+            'name': name,
+            'symbol': symbol,
+            'owner': owner,
+            'base_uri': base_uri or "",
+            'next_token_id': 1,
+            'tokens': {},  # token_id(str) -> {owner, metadata, token_uri}
+            'balances': {}  # address -> count
+        }
+        self.save_chain()
+        return {
+            'contract': contract_address,
+            'name': name,
+            'symbol': symbol,
+            'owner': owner
+        }
+
+    def mint_nft(self, contract, to, metadata=None):
+        self._ensure_contracts_registry()
+        metadata = metadata or {}
+        if contract not in self.contracts['nft']:
+            raise ValueError("NFT contract does not exist")
+        coll = self.contracts['nft'][contract]
+        token_id = str(coll['next_token_id'])
+        coll['next_token_id'] += 1
+        base_uri = coll.get('base_uri') or ""
+        token_uri = f"{base_uri}{token_id}" if base_uri else metadata.get('token_uri', '')
+        coll['tokens'][token_id] = {
+            'owner': to,
+            'metadata': metadata,
+            'token_uri': token_uri
+        }
+        coll['balances'][to] = int(coll['balances'].get(to, 0)) + 1
+        return token_id
+
+    def transfer_nft(self, contract, token_id, from_addr, to_addr):
+        self._ensure_contracts_registry()
+        if contract not in self.contracts['nft']:
+            raise ValueError("NFT contract does not exist")
+        coll = self.contracts['nft'][contract]
+        token = coll['tokens'].get(token_id)
+        if not token:
+            raise ValueError("Token does not exist")
+        if token['owner'] != from_addr:
+            raise ValueError("Sender is not token owner")
+        token['owner'] = to_addr
+        coll['balances'][from_addr] = max(0, int(coll['balances'].get(from_addr, 0)) - 1)
+        coll['balances'][to_addr] = int(coll['balances'].get(to_addr, 0)) + 1
+        return True
 
 # -------------------------------
 # Flask App (Enhanced)
@@ -635,6 +739,111 @@ def check_balance():
         "balances": {"MAIN": str(main_balance)}, 
         "tokens": {k: str(v) for k, v in token_balances.items()}
     })
+
+# -------------------------------
+# NFT REST API
+# -------------------------------
+
+TREASURY_ADDRESS = "0x00000000000000000000000000000000000000fe"
+MINT_FEE_LVT = Decimal('10')
+
+@app.route('/nft/deploy', methods=['POST'])
+def nft_deploy():
+    data = request.get_json() or {}
+    name = data.get('name')
+    symbol = data.get('symbol')
+    base_uri = data.get('base_uri', '')
+    owner = data.get('owner', node_address)
+    if not name or not symbol:
+        return jsonify({"error": "name and symbol are required"}), 400
+    try:
+        result = blockchain.create_nft_contract(owner, name, symbol, base_uri)
+        return jsonify({"message": "NFT contract deployed", **result})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route('/nft/mint', methods=['POST'])
+def nft_mint_route():
+    data = request.get_json() or {}
+    contract = data.get('contract')
+    to_addr = data.get('to')
+    minter = data.get('minter')
+    metadata = data.get('metadata', {})
+    if not contract or not to_addr or not minter:
+        return jsonify({"error": "contract, to, minter are required"}), 400
+    # Construct a transaction that pays the mint fee to treasury and carries NFT mint intent
+    tx = Transaction(
+        sender=minter,
+        receiver=TREASURY_ADDRESS,
+        amount=str(MINT_FEE_LVT),
+        fee=0,
+        tx_type='nft_mint',
+        data={'contract': contract, 'to': to_addr, 'metadata': metadata}
+    )
+    if blockchain.add_transaction_to_mempool(tx):
+        return jsonify({"message": "Mint submitted to mempool", "tx_id": tx.tx_id})
+    return jsonify({"error": "Mint validation failed"}), 400
+
+@app.route('/nft/transfer', methods=['POST'])
+def nft_transfer_route():
+    data = request.get_json() or {}
+    contract = data.get('contract')
+    token_id = data.get('token_id')
+    from_addr = data.get('from')
+    to_addr = data.get('to')
+    if not contract or token_id is None or not from_addr or not to_addr:
+        return jsonify({"error": "contract, token_id, from, to are required"}), 400
+    tx = Transaction(
+        sender=from_addr,
+        receiver=to_addr,
+        amount='0',
+        fee=0,
+        tx_type='nft_transfer',
+        data={'contract': contract, 'token_id': token_id, 'to': to_addr}
+    )
+    if blockchain.add_transaction_to_mempool(tx):
+        return jsonify({"message": "Transfer submitted to mempool", "tx_id": tx.tx_id})
+    return jsonify({"error": "Transfer validation failed"}), 400
+
+@app.route('/nft/ownerOf')
+def nft_owner_of():
+    contract = request.args.get('contract')
+    token_id = request.args.get('token_id')
+    if not contract or token_id is None:
+        return jsonify({"error": "contract and token_id are required"}), 400
+    coll = blockchain.contracts.get('nft', {}).get(contract)
+    if not coll:
+        return jsonify({"error": "contract not found"}), 404
+    token = coll['tokens'].get(str(token_id))
+    if not token:
+        return jsonify({"error": "token not found"}), 404
+    return jsonify({"owner": token['owner']})
+
+@app.route('/nft/balanceOf')
+def nft_balance_of():
+    contract = request.args.get('contract')
+    address = request.args.get('address')
+    if not contract or not address:
+        return jsonify({"error": "contract and address are required"}), 400
+    coll = blockchain.contracts.get('nft', {}).get(contract)
+    if not coll:
+        return jsonify({"error": "contract not found"}), 404
+    balance = int(coll['balances'].get(address, 0))
+    return jsonify({"balance": balance})
+
+@app.route('/nft/tokenURI')
+def nft_token_uri():
+    contract = request.args.get('contract')
+    token_id = request.args.get('token_id')
+    if not contract or token_id is None:
+        return jsonify({"error": "contract and token_id are required"}), 400
+    coll = blockchain.contracts.get('nft', {}).get(contract)
+    if not coll:
+        return jsonify({"error": "contract not found"}), 404
+    token = coll['tokens'].get(str(token_id))
+    if not token:
+        return jsonify({"error": "token not found"}), 404
+    return jsonify({"tokenURI": token.get('token_uri', '')})
 
 @app.route('/add_transaction', methods=['POST'])
 def add_transaction():
@@ -783,7 +992,7 @@ def health():
 # -------------------------------
 
 # Chain configuration for MetaMask (will be read from persisted blockchain state)
-NATIVE_SYMBOL = "LV"
+NATIVE_SYMBOL = "LVT"
 
 def to_hex(value):
     try:
@@ -795,6 +1004,49 @@ def to_hex_wei(decimal_amount: Decimal) -> str:
     # Represent balances in 18 decimals like wei
     scaled = int((decimal_amount * Decimal("1000000000000000000")).to_integral_value(rounding=None))
     return hex(scaled)
+
+def from_hex_wei(hex_value: str) -> Decimal:
+    try:
+        value_int = int(hex_value, 16)
+        return Decimal(value_int) / Decimal("1000000000000000000")
+    except Exception:
+        return Decimal('0')
+
+def to_decimal_from_wei_int(value_int: int) -> Decimal:
+    try:
+        return Decimal(value_int) / Decimal("1000000000000000000")
+    except Exception:
+        return Decimal('0')
+
+def _is_typed_tx(raw_bytes: bytes) -> bool:
+    # EIP-2718 typed tx start with 0x01 (2930) or 0x02 (1559) etc.
+    if not raw_bytes:
+        return False
+    first = raw_bytes[0]
+    # RLP list first byte typically >= 0xc0; typed are small (0x01/0x02...)
+    return first in (1, 2)
+
+def _rlp_encode_legacy_tx_fields(fields: list) -> bytes:
+    return rlp.encode(fields)
+
+def _get_legacy_tx_signing_hash(nonce_b, gas_price_b, gas_b, to_b, value_b, data_b, chain_id: int | None):
+    if chain_id is None:
+        payload = _rlp_encode_legacy_tx_fields([nonce_b, gas_price_b, gas_b, to_b, value_b, data_b])
+    else:
+        payload = _rlp_encode_legacy_tx_fields([nonce_b, gas_price_b, gas_b, to_b, value_b, data_b, chain_id, 0, 0])
+    return keccak(payload)
+
+def _recover_sender_address_from_vrs(msg_hash: bytes, v: int, r: int, s: int, chain_id: int | None) -> str:
+    # Normalize v for recovery per EIP-155
+    if chain_id is None:
+        recid = v - 27
+        v_norm = 27 + (recid & 1)
+    else:
+        recid = (v - 35 - 2 * chain_id) % 2
+        v_norm = 27 + (recid & 1)
+    sig = Signature(vrs=(v_norm, r, s))
+    pub = sig.recover_public_key_from_msg_hash(msg_hash)
+    return to_checksum_address(pub.to_address())
 
 def block_hash(block_obj):
     try:
@@ -927,6 +1179,22 @@ def json_rpc():
     if method == "eth_getTransactionCount":
         return jsonify({"jsonrpc": "2.0", "id": rpc_id, "result": "0x0"})
 
+    if method == "eth_sendTransaction":
+        # Map simple MetaMask tx to internal transfer
+        if not params:
+            return jsonify({"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32602, "message": "Invalid params"}})
+        txo = params[0] or {}
+        from_addr = txo.get("from")
+        to_addr = txo.get("to")
+        value_hex = txo.get("value", "0x0")
+        if not from_addr or not to_addr:
+            return jsonify({"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32602, "message": "from and to required"}})
+        amount = from_hex_wei(value_hex)
+        tx = Transaction(sender=from_addr, receiver=to_addr, amount=str(amount), fee=0, tx_type="transfer")
+        if blockchain.add_transaction_to_mempool(tx):
+            return jsonify({"jsonrpc": "2.0", "id": rpc_id, "result": "0x" + tx.tx_id})
+        return jsonify({"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32000, "message": "Transaction validation failed"}})
+
     # Blocks
     if method == "eth_blockNumber":
         head = max(0, len(blockchain.chain) - 1)
@@ -998,8 +1266,82 @@ def json_rpc():
         return jsonify({"jsonrpc": "2.0", "id": rpc_id, "result": receipt})
 
     if method == "eth_sendRawTransaction":
-        # Not supported: this chain does not accept Ethereum-signed raw tx
-        return jsonify({"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32000, "message": "eth_sendRawTransaction not supported on this chain"}})
+        # Ethereum-compatible legacy RLP-signed transactions only (no typed tx)
+        if not params:
+            return jsonify({"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32602, "message": "Invalid params"}})
+        raw = params[0]
+        if not isinstance(raw, str) or not raw.startswith('0x'):
+            return jsonify({"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32602, "message": "Invalid raw tx hex"}})
+        try:
+            raw_bytes = bytes.fromhex(raw[2:])
+        except Exception:
+            return jsonify({"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32602, "message": "Invalid raw tx hex"}})
+
+        # Reject typed transactions for now
+        if _is_typed_tx(raw_bytes):
+            return jsonify({"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32000, "message": "Typed transactions (EIP-2718/1559) not supported"}})
+
+        # Decode legacy RLP tx: [nonce, gasPrice, gasLimit, to, value, data, v, r, s]
+        try:
+            fields = rlp.decode(raw_bytes)
+            if not isinstance(fields, list) or len(fields) != 9:
+                raise ValueError("Invalid legacy RLP tx")
+            nonce_b, gas_price_b, gas_b, to_b, value_b, data_b, v_b, r_b, s_b = fields
+            v = int.from_bytes(v_b or b"\x00", byteorder='big')
+            r = int.from_bytes(r_b or b"\x00", byteorder='big')
+            s = int.from_bytes(s_b or b"\x00", byteorder='big')
+            # Basic signature sanity
+            if r == 0 or s == 0 or v == 0:
+                raise ValueError("Invalid signature components")
+
+            # EIP-155 chain id derivation
+            tx_chain_id = None
+            if v >= 35:
+                tx_chain_id = (v - 35) // 2
+            # Build sighash per legacy rules
+            msg_hash = _get_legacy_tx_signing_hash(nonce_b, gas_price_b, gas_b, to_b, value_b, data_b, tx_chain_id)
+
+            # Recover sender
+            try:
+                sender_addr = _recover_sender_address_from_vrs(msg_hash, v, r, s, tx_chain_id)
+            except BadSignatureError:
+                return jsonify({"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32000, "message": "Invalid signature"}})
+
+            # Chain ID enforcement when present
+            if tx_chain_id is not None and tx_chain_id != blockchain.chain_id:
+                return jsonify({"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32000, "message": "Wrong chainId in transaction"}})
+
+            # Parse value and to
+            value_int = int.from_bytes(value_b or b"\x00", byteorder='big')
+            amount = to_decimal_from_wei_int(value_int)
+            if to_b in (b"", None):
+                return jsonify({"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32000, "message": "Contract creation not supported"}})
+            to_addr = to_checksum_address('0x' + (to_b.hex() if isinstance(to_b, (bytes, bytearray)) else bytes(to_b).hex()))
+
+            tx = Transaction(sender=sender_addr, receiver=to_addr, amount=str(amount), fee=0, tx_type="transfer")
+            if blockchain.add_transaction_to_mempool(tx):
+                return jsonify({"jsonrpc": "2.0", "id": rpc_id, "result": "0x" + tx.tx_id})
+            return jsonify({"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32000, "message": "Transaction validation failed"}})
+
+        except rlp.DecodingError:
+            # Fallback: maintain support for custom hex-encoded JSON for dev tools
+            try:
+                payload_str = bytes.fromhex(raw[2:]).decode('utf-8')
+                obj = json.loads(payload_str)
+                from_addr = obj.get('from')
+                to_addr = obj.get('to', TREASURY_ADDRESS if obj.get('tx_type') == 'nft_mint' else None)
+                value_hex = obj.get('value', '0x0')
+                tx_type = obj.get('tx_type', 'transfer')
+                data_obj = obj.get('data', {})
+                if not from_addr or to_addr is None:
+                    raise ValueError('from/to required')
+                amount = from_hex_wei(value_hex)
+                tx = Transaction(sender=from_addr, receiver=to_addr, amount=str(amount), fee=0, tx_type=tx_type, data=data_obj)
+                if blockchain.add_transaction_to_mempool(tx):
+                    return jsonify({"jsonrpc": "2.0", "id": rpc_id, "result": "0x" + tx.tx_id})
+                return jsonify({"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32000, "message": "Transaction validation failed"}})
+            except Exception:
+                return jsonify({"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32000, "message": "Unsupported raw transaction format"}})
 
     if method == "eth_estimateGas":
         return jsonify({"jsonrpc": "2.0", "id": rpc_id, "result": "0x5208"})
